@@ -43,6 +43,70 @@ jobs:
         run: gmi-appsec-ci --baseline "$GITHUB_WORKSPACE" "$GITHUB_REPOSITORY"
 
       - name: Run delta gate
+        id: delta
         if: ${{ (github.event_name == 'push' && !contains(github.event.head_commit.message, '[appsec-baseline]')) || (github.event_name == 'workflow_dispatch' && inputs.mode == 'scan') }}
         shell: bash
         run: gmi-appsec-ci "$GITHUB_WORKSPACE" "$GITHUB_REPOSITORY"
+
+      # Diagnostic scan only. The service-side delta comparison above is the
+      # sole authority for PASS/FAIL; this local Trivy report is an aid for
+      # remediation and must not reset the baseline or substitute for it.
+      - name: Collect actionable Trivy findings after gate failure
+        if: ${{ failure() && steps.delta.outcome == 'failure' }}
+        continue-on-error: true
+        shell: bash
+        env:
+          TRIVY_CACHE_DIR: /var/lib/trivy-cache
+        run: |
+          set -uo pipefail
+          if ! command -v trivy >/dev/null 2>&1; then
+            echo "::warning::Trivy CLI unavailable; see the GMI AppSec dashboard for detailed findings."
+            exit 0
+          fi
+          trivy fs --scanners vuln,misconfig,license --format json \
+            --output "${RUNNER_TEMP}/gmi-trivy-diagnostic.json" \
+            --timeout 10m . || {
+            echo "::warning::Diagnostic Trivy scan failed; the original gate remains failed."
+            exit 0
+          }
+          python3 - <<'PY'
+          import json, os
+          from collections import Counter
+          p = os.path.join(os.environ['RUNNER_TEMP'], 'gmi-trivy-diagnostic.json')
+          with open(p, encoding='utf-8') as f:
+              data = json.load(f)
+          counts = Counter()
+          lines = []
+          def clean(v):
+              return str(v or '').replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')[:700]
+          for result in data.get('Results', []):
+              target = result.get('Target', '?')
+              for kind, field in [('vulnerability', 'Vulnerabilities'), ('misconfiguration', 'Misconfigurations'), ('license', 'Licenses')]:
+                  for item in result.get(field) or []:
+                      severity = item.get('Severity', 'UNKNOWN').upper()
+                      counts[(kind, severity)] += 1
+                      if severity not in ('HIGH', 'CRITICAL'):
+                          continue
+                      ident = item.get('VulnerabilityID') or item.get('ID') or item.get('Name') or 'unknown'
+                      pkg = item.get('PkgName') or item.get('Package') or '-'
+                      installed = item.get('InstalledVersion') or '-'
+                      fixed = item.get('FixedVersion') or 'not specified'
+                      description = item.get('Title') or item.get('Description') or ''
+                      lines.append((severity, kind, target, ident, pkg, installed, fixed, description))
+          print('Diagnostic HIGH/CRITICAL findings (full checkout, not baseline delta):')
+          if not lines:
+              print('No HIGH/CRITICAL entries in standalone scan. Check central scan data for delta details.')
+          for severity, kind, target, ident, pkg, installed, fixed, description in lines[:100]:
+              print(f'[{severity}] {kind} {ident} | {target} | {pkg} {installed} -> {fixed}')
+              print(f'::warning title={clean(severity+" "+kind+" "+ident)}::{clean(target+" | "+pkg+" "+installed+" -> "+fixed+" | "+description)}')
+          if len(lines) > 100:
+              print(f'::warning::Showing first 100 of {len(lines)} HIGH/CRITICAL findings.')
+          print('Diagnostic counts:', dict(sorted((f'{k}:{s}', v) for (k,s),v in counts.items())))
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as f:
+              f.write('### GMI AppSec diagnostic scan\n\n')
+              f.write('**Not a baseline-delta report.** The central service gate remains authoritative.\n\n')
+              f.write('| Severity | Kind | Finding | Target | Package | Installed | Fixed |\n|---|---|---|---|---|---|---|\n')
+              for severity, kind, target, ident, pkg, installed, fixed, _ in lines[:100]:
+                  vals = [severity,kind,ident,target,pkg,installed,fixed]
+                  f.write('| '+' | '.join(str(v).replace('|', '\\|').replace('\n', ' ')[:180] for v in vals)+' |\n')
+          PY
